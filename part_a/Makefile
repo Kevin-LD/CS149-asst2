@@ -6,7 +6,10 @@ else
     CXX = g++ -m64
 endif
 
+# original
 CXXFLAGS=-I. -I../common -I../tests -Iobjs/ -O3 -std=c++11 -Wall
+# debug
+# CXXFLAGS=-m64 -I. -I../common -I../tests -Iobjs/ -g -O0 -std=c++11 -Wall
 
 APP_NAME=runtasks
 OBJDIR=objs
