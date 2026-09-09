@@ -2,6 +2,12 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
+#include <queue>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <unordered_set>
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -68,6 +74,35 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+    private:
+        struct bulkLaunch {
+            TaskID lauch_id;
+            IRunnable* runnable;
+            int num_total_tasks;
+            // 这个也许用 list 会更高效，先用 vector 试试
+            int num_unresolved_deps;
+            int next_task;
+            int num_tasks_finished;
+            bulkLaunch(TaskID lauch_id, IRunnable* runnable, int num_total_tasks, int num_unresolved_deps)
+                : lauch_id(lauch_id), runnable(runnable), num_total_tasks(num_total_tasks), num_unresolved_deps(num_unresolved_deps), next_task(0), num_tasks_finished(0) {}
+        };
+        std::unordered_set<bulkLaunch*> waiting_launch;
+        std::queue<bulkLaunch*> ready_queue;
+        // 希望通过 launch_id 找到 launch 做完成 deps 的通知
+        std::vector<bulkLaunch*> all_launched;
+        std::vector<std::vector<TaskID>> dep_graph;
+        int num_threads;
+        // 不在 ready_queue 上，但还有 thread 在工作的 bulkLaunch 数量
+        int waiting_to_finish;
+        std::atomic<bool> thread_pool_survive;
+        std::thread* thread_pool;
+        void worker();
+        std::mutex mtx;
+        std::condition_variable cv_done;
+        std::condition_variable cv_ready;
+        TaskID next_bulk_launch_id;
+        int check_deps(const std::vector<TaskID>& deps);
+        std::unordered_set<TaskID> finished_launch;
 };
 
 #endif
