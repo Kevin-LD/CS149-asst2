@@ -20,7 +20,8 @@ else:
 REFERENCE_BINARY_NAME = "runtasks_ref"
 print(REFERENCE_BINARY_NAME)
 print(platform.system(), platform.machine())
-TASKSYS_DEFAULT_NUM_THREADS = multiprocessing.cpu_count()
+# Stanford CS149 uses a 16 core machine
+TASKSYS_DEFAULT_NUM_THREADS = min(multiprocessing.cpu_count(), 16)
 UNSPECIFIED_NUM_THREADS = -1
 
 PERF_THRESHOLD = 1.2
