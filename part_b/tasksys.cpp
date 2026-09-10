@@ -136,6 +136,7 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
     for (int t = 0; t < num_threads; t++) {
         thread_pool[t] = std::thread(&TaskSystemParallelThreadPoolSleeping::worker, this); 
     }
+    all_launched.reserve(4000);
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
@@ -151,54 +152,56 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
         thread_pool[t].join();
     }
     delete[] thread_pool;
+    for (bulkLaunch* bl : all_launched) {
+        delete bl;
+    }
 }
 
-// return number of deps left unresolved in deps
-int TaskSystemParallelThreadPoolSleeping::check_deps(const std::vector<TaskID>& deps) {
-    int num_unresolved_deps = deps.size();
-    for (auto iter = deps.begin(); iter != deps.end(); iter++) {
-        if (finished_launch.count(*iter)) {
-            num_unresolved_deps--;
-        }
-    }
-    return num_unresolved_deps;
-}
 
 void TaskSystemParallelThreadPoolSleeping::worker() {
     while (true) {
+        bool was_empty = false;
         std::unique_lock<std::mutex> lock(mtx);
         cv_ready.wait(lock, [this] { return ready_queue.size() != 0 || !thread_pool_survive; });
         if (!thread_pool_survive) {
             return;
         }
         bulkLaunch* cur_bl = ready_queue.front();
-        int cur_task_id = cur_bl->next_task;
-        cur_bl->next_task++;
-        if (cur_bl->next_task == cur_bl->num_total_tasks) {
+        lock.unlock();
+        int cur_task_id = cur_bl->next_task.fetch_add(1);
+        if (cur_task_id >= cur_bl->num_total_tasks) {
+            continue;
+        }
+        if (cur_task_id == cur_bl->num_total_tasks - 1) {
+            lock.lock();
             ready_queue.pop();
             waiting_to_finish++;
+            lock.unlock();
         }
-        lock.unlock();
         cur_bl->runnable->runTask(cur_task_id, cur_bl->num_total_tasks);
-        lock.lock();
-        cur_bl->num_tasks_finished++;
-        if (cur_bl->num_tasks_finished == cur_bl->num_total_tasks) {
+        
+        int num_finished = cur_bl->num_tasks_finished.fetch_add(1)+1;
+
+        if (num_finished == cur_bl->num_total_tasks) {
+            lock.lock();
             waiting_to_finish--;
-            TaskID finished_launch_id = cur_bl->lauch_id;
-            finished_launch.insert(finished_launch_id);
-            if (finished_launch_id < (TaskID)dep_graph.size()) {
-                for (auto iter = dep_graph[finished_launch_id].begin(); iter != dep_graph[finished_launch_id].end(); iter++) {
-                    bulkLaunch* notified_launch = all_launched[*iter];
-                    notified_launch->num_unresolved_deps--;
-                    if (notified_launch->num_unresolved_deps == 0) {
-                        waiting_launch.erase(notified_launch);
-                        ready_queue.push(notified_launch);
+            cur_bl->finished = true;
+            for (auto notified_launch : cur_bl->dependents) {
+                notified_launch->num_unresolved_deps--;
+                if (notified_launch->num_unresolved_deps == 0) {
+                    ready_queue.push(notified_launch);
+                    if (ready_queue.size() == 1) {
+                        was_empty = true;
                     }
                 }
             }
-            delete cur_bl;
-            if (waiting_to_finish == 0 && waiting_launch.size() == 0 && ready_queue.size() == 0) {
+            if (waiting_to_finish == 0 && ready_queue.size() == 0) {
                 cv_done.notify_one();
+            }
+            lock.unlock();
+            if (was_empty) {
+                // 这里采取锁外提交，可以避免唤醒线程和持锁线程的 contention。
+                cv_ready.notify_all();
             }
         }
     }
@@ -230,20 +233,17 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
     //     runnable->runTask(i, num_total_tasks);
     // }
     
-    std::lock_guard<std::mutex> lock(mtx);
-    int num_unresolved_deps = check_deps(deps);
-    bulkLaunch* bl = new bulkLaunch(next_bulk_launch_id, runnable, num_total_tasks, num_unresolved_deps);
-    next_bulk_launch_id++;
     
-    TaskID end = bl->lauch_id;
-    for (auto iter = deps.begin(); iter != deps.end(); iter++) {
-        TaskID start = *iter;
-        // 虽然测试里好像没有，但也支持对后来 launch 的 dep
-        TaskID max_vertex = std::max(start, end);
-        if (max_vertex >= (TaskID)dep_graph.size()) {
-            dep_graph.resize(max_vertex + 1);
+    bulkLaunch* bl = new bulkLaunch(next_bulk_launch_id, runnable, num_total_tasks, 0);
+    next_bulk_launch_id++;
+
+    std::lock_guard<std::mutex> lock(mtx);
+    for (TaskID id : deps) {
+        bulkLaunch* predecessor = all_launched[id];
+        if (!predecessor->finished) {
+            bl->num_unresolved_deps++;
+            predecessor->dependents.push_back(bl);
         }
-        dep_graph[start].push_back(end);
     }
 
     all_launched.push_back(bl);
@@ -251,11 +251,13 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
     if (bl->num_unresolved_deps == 0) {
         ready_queue.push(bl);
         if (ready_queue.size() == 1) {
+            // 这里采用锁内 notify，是因为锁内 notify 有利于 main thread 再次得到锁，
+            // 可以一次提交大量任务到 all_launch 中，猜想这会更加内存友好。
+            // 实验发现，如果改成锁外提交会 ！大幅！ 降低速度。
             cv_ready.notify_all();
         }
         return bl->lauch_id;
     }
-    waiting_launch.insert(bl);
     return bl->lauch_id;
 }
 
@@ -265,6 +267,6 @@ void TaskSystemParallelThreadPoolSleeping::sync() {
     // TODO: CS149 students will modify the implementation of this method in Part B.
     //
     std::unique_lock<std::mutex> lock(mtx);
-    cv_done.wait(lock, [this] { return waiting_to_finish == 0 && waiting_launch.size() == 0 && ready_queue.size() == 0; });
+    cv_done.wait(lock, [this] { return waiting_to_finish == 0 && ready_queue.size() == 0; });
     return;
 }
