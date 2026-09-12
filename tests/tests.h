@@ -6,6 +6,8 @@
 #include <thread>
 #include <atomic>
 #include <set>
+#include <algorithm>
+#include <mutex>
 
 #include "CycleTimer.h"
 #include "itasksys.h"
@@ -60,57 +62,163 @@ typedef struct {
 /*
  * Implement your task here
 */
+
+// Task 说明：非常简单的测试，不做任何有意义的任务，只是 sleep 一段时间
+// 引入 A -> {B, C} -> D 的菱形 DAG 依赖（只有 do_async 版本）。主要测试两件事：
+// 1. dep resolution 和 sync() 的 correctness
+// 2. B 和 C 是否真的并行。
+// motivation：我的 ready queue 是 bulkLaunch level 的，
+// In the spirit of doing the simplest thing first，我最初的 naive 实现只有一个 bulkLaunch 之中的并行
+// 后来引入了 waiting_to_finish 等字段，支持了不同 bulkLaunch 之间的并行。
+// 此 test 专门用来测试实现是否正确，是否真的支持了 bulkLauch 之间的并行。
+
 class YourTask : public IRunnable {
     public:
-        YourTask() {}
-        ~YourTask() {}
-        void runTask(int task_id, int num_total_tasks) {}
+        struct TaskTiming {
+            double start = -1.0;
+            double end = -1.0;
+            int calls = 0;
+        };
+        struct Snapshot {
+            std::vector<TaskTiming> tasks;
+            bool valid;
+        };
+
+        explicit YourTask(int num_tasks) : timings_(num_tasks), valid_(true) {}
+
+        void runTask(int task_id, int num_total_tasks) override {
+            const double start = CycleTimer::currentSeconds();
+            {
+                std::lock_guard<std::mutex> lock(timing_mutex_);
+                if (num_total_tasks != static_cast<int>(timings_.size()) ||
+                    task_id < 0 || task_id >= static_cast<int>(timings_.size())) {
+                    valid_ = false;
+                    return;
+                }
+                if (++timings_[task_id].calls != 1) {
+                    valid_ = false;
+                    return;
+                }
+                timings_[task_id].start = start;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            const double end = CycleTimer::currentSeconds();
+            std::lock_guard<std::mutex> lock(timing_mutex_);
+            timings_[task_id].end = end;
+        }
+
+        Snapshot snapshot() {
+            std::lock_guard<std::mutex> lock(timing_mutex_);
+            return Snapshot{timings_, valid_};
+        }
+
+    private:
+        std::vector<TaskTiming> timings_;
+        bool valid_;
+        std::mutex timing_mutex_;
 };
-/*
- * Implement your test here. Call this function from a wrapper that passes in
- * do_async and num_elements. See `simpleTest`, `simpleTestSync`, and
- * `simpleTestAsync` as an example.
- */
-TestResults yourTest(ITaskSystem* t, bool do_async, int num_elements, int num_bulk_task_launches) {
-    // TODO: initialize your input and output buffers
-    int* output = new int[num_elements];
 
-    // TODO: instantiate your bulk task launches
+TestResults yourTest(ITaskSystem* t, bool do_async, int /*num_elements*/,
+                     int /*num_bulk_task_launches*/) {
+    const int num_total_tasks = 8;
+    // Each runnable belongs to exactly one launch, so task_id identifies
+    // a timing slot without needing a new scheduler API.
+    YourTask A(num_total_tasks), B(num_total_tasks), C(num_total_tasks), D(num_total_tasks);
+    YourTask* launches[] = {&A, &B, &C, &D};
+    const char* names[] = {"A", "B", "C", "D"};
 
-    // Run the test
-    double start_time = CycleTimer::currentSeconds();
+    const double test_start = CycleTimer::currentSeconds();
     if (do_async) {
-        // TODO:
-        // initialize dependency vector
-        // make calls to t->runAsyncWithDeps and push TaskID to dependency vector
-        // t->sync() at end
+        TaskID a = t->runAsyncWithDeps(&A, num_total_tasks, {});
+        TaskID b = t->runAsyncWithDeps(&B, num_total_tasks, {a});
+        TaskID c = t->runAsyncWithDeps(&C, num_total_tasks, {a});
+        t->runAsyncWithDeps(&D, num_total_tasks, {b, c});
     } else {
-        // TODO: make calls to t->run
+        for (YourTask* launch : launches) {
+            t->run(launch, num_total_tasks);
+        }
     }
-    double end_time = CycleTimer::currentSeconds();
+    t->sync();
+    const double sync_end = CycleTimer::currentSeconds();
 
-    // Correctness validation
+    YourTask::Snapshot records[] = {A.snapshot(), B.snapshot(), C.snapshot(), D.snapshot()};
+    double starts[4], ends[4];
+    bool complete[4];
+    bool execution_correct = true;
+    bool sync_correct = true;
+
+    printf("\n===== Diamond Dependency Test (%s, %s) =====\n",
+           t->name(), do_async ? "async" : "sync");
+    printf("Dependency graph: A -> {B, C} -> D\n");
+    printf("runTask timeline relative to test start (ms):\n");
+    for (int i = 0; i < 4; ++i) {
+        starts[i] = sync_end;
+        ends[i] = test_start;
+        complete[i] = records[i].valid;
+        double sum = 0.0;
+        for (const auto& task : records[i].tasks) {
+            if (task.calls != 1 || task.start < test_start || task.end < task.start) {
+                complete[i] = false;
+                continue;
+            }
+            starts[i] = std::min(starts[i], task.start);
+            ends[i] = std::max(ends[i], task.end);
+            sum += task.end - task.start;
+            if (task.end > sync_end) sync_correct = false;
+        }
+        execution_correct = execution_correct && complete[i];
+        if (complete[i]) {
+            printf("  %s: [%8.3f, %8.3f] ms; launch span = %.3f ms\n",
+                   names[i], (starts[i] - test_start) * 1000,
+                   (ends[i] - test_start) * 1000, (ends[i] - starts[i]) * 1000);
+        } else {
+            printf("  %s: INCOMPLETE or invalid task execution\n", names[i]);
+        }
+    }
+    // A launch span includes gaps between its tasks. The sum counts concurrent
+    // intervals separately. Both are wall-clock measurements, not CPU time.
+    printf("  sync returned at %.3f ms\n", (sync_end - test_start) * 1000);
+
+    const int predecessors[] = {0, 0, 1, 2};
+    const int successors[] = {1, 2, 3, 3};
+    bool dependency_correct = true;
+    for (int edge = 0; edge < 4; ++edge) {
+        int from = predecessors[edge], to = successors[edge];
+        bool correct = complete[from] && complete[to] && starts[to] >= ends[from];
+        dependency_correct = dependency_correct && correct;
+        printf("  %s -> %s: %s\n", names[from], names[to], correct ? "CORRECT" : "INCORRECT");
+    }
+    sync_correct = sync_correct && execution_correct;
+    printf("  Every task executed exactly once: %s\n", execution_correct ? "YES" : "NO");
+    printf("  All task bodies finished before sync returned: %s\n", sync_correct ? "YES" : "NO");
+
+    // Check actual task intervals rather than just overlapping launch spans:
+    // B and C could otherwise alternate serially and produce a false positive.
+    double max_pair_overlap = 0.0;
+    if (complete[1] && complete[2]) {
+        for (const auto& b : records[1].tasks) {
+            for (const auto& c : records[2].tasks) {
+                max_pair_overlap = std::max(max_pair_overlap,
+                    std::min(b.end, c.end) - std::max(b.start, c.start));
+            }
+        }
+    }
+    printf("  B/C runTask overlap observed: %s; maximum task-pair overlap = %.3f ms\n",
+           max_pair_overlap > 0 ? "YES" : "NO", max_pair_overlap * 1000);
+    printf("  Overlap is diagnostic: serial/one-worker execution is allowed.\n");
+
     TestResults results;
-    results.passed = true;
-
-    for (int i=0; i<num_elements; i++) {
-        int value = 0; // TODO: initialize value
-        for (int j=0; j<num_bulk_task_launches; j++) {
-            // TODO: update value as expected
-        }
-
-        int expected = value;
-        if (output[i] != expected) {
-            results.passed = false;
-            printf("%d: %d expected=%d\n", i, output[i], expected);
-            break;
-        }
-    }
-    results.time = end_time - start_time;
-
-    delete [] output;
-
+    results.passed = execution_correct && dependency_correct && sync_correct;
+    results.time = sync_end - test_start; // Exclude reporting and analysis.
+    printf("  Correctness: %s\n===================================\n", results.passed ? "PASS" : "FAIL");
     return results;
+}
+
+TestResults yourTestAsync(ITaskSystem *t) {
+    // 其实没有用到后面几个参数
+    return yourTest(t, true, 1, 1);
 }
 
 /*
