@@ -216,9 +216,18 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_tota
     // tasks sequentially on the calling thread.
     //
 
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
-    }
+    // for (int i = 0; i < num_total_tasks; i++) {
+    //     runnable->runTask(i, num_total_tasks);
+    // }
+
+    std::vector<TaskID> noDeps;
+    runAsyncWithDeps(runnable, num_total_tasks, noDeps);
+    sync();
+
+    // Rm. 一定需要主线程 run() 和 runAsyncWithDeps() 不混用的假设才可以这样实现 run()
+    // 因为 run() 的语义是完成当前 bulk 就返回，但是 sync() 会等待所有之前的 runAsyncWithDeps()，不止当前的 bulk。
+    // 例如 runAsyncWithDeps(A, ...); run(B, ...); 这样 run() 会在 A, B 都完成时返回，而不是我们希望的，在 B 完成时就返回。
+
 }
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
